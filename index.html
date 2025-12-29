@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>タイムライン地図表示</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        display: flex;
+        height: 100vh;
+    }
+
+    #sidebar {
+        width: 260px;
+        background: #f4f4f4;
+        border-right: 1px solid #ccc;
+        overflow-y: auto;
+        padding: 10px;
+        height: calc(100vh - 40px);
+    }
+
+    #sidebar h3 {
+        margin-top: 0;
+    }
+
+    .list-item {
+        padding: 6px;
+        border-bottom: 1px solid #ddd;
+        cursor: pointer;
+    }
+
+    .list-item:hover {
+        background: #e0e0e0;
+    }
+
+    #main {
+        flex: 1;
+        padding: 20px;
+    }
+
+    #map {
+        height: 500px;
+        margin-top: 20px;
+    }
+
+    button {
+        padding: 10px 20px;
+        font-size: 16px;
+        margin-right: 10px;
+        margin-top: 5px;
+    }
+
+    .small-btn {
+        padding: 5px 10px;
+        font-size: 12px;
+        margin-right: 5px;
+    }
+
+    .box { margin-bottom: 10px; }
+    .speed-box { margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+    <h3>ポイント一覧</h3>
+    <div id="pointList"></div>
+</div>
+
+<div id="main">
+
+<h2>タイムライン地図表示</h2>
+
+<div class="box">
+    <input type="file" id="inputFile" accept=".json">
+</div>
+
+<div class="box">
+    <label>開始日: <input type="date" id="startDate"></label>
+</div>
+
+<div class="box">
+    <label>終了日: <input type="date" id="endDate"></label>
+</div>
+
+<button onclick="convert()">変換して地図に表示</button>
+<button onclick="saveGeoJSON()">GeoJSON を保存</button>
+
+<div class="speed-box">
+    <label>再生速度（ms）: <span id="speedLabel">500</span></label><br>
+    <input type="range" id="speedSlider" min="50" max="2000" value="500" step="50"
+           oninput="updateSpeedLabel()">
+</div>
+
+<div class="box">
+    <button class="small-btn" onclick="setStandardMap()">標準地図</button>
+    <button class="small-btn" onclick="setSatelliteMap()">航空写真</button>
+
+    <button class="small-btn" onclick="startAnimation()">▶ 再生</button>
+    <button class="small-btn" onclick="stopAnimation()">■ 停止</button>
+    <button class="small-btn" onclick="stepBackward()">←戻る</button>
+    <button class="small-btn" onclick="stepForward()">→進む</button>
+    <button class="small-btn" onclick="toggleLine()">経路線 表示/非表示</button>
+</div>
+
+<div id="map"></div>
+
+</div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+<script>
+/* ------------------------------
+   変数定義
+------------------------------ */
+let map;
+let geoLayer;
+let lineLayer;
+let movingMarker;
+let animationIndex = 0;
+let animationTimer = null;
+let lastGeoJSON = null;
+let currentSpeed = 500;
+let lineVisible = true;
+let pointFeatures = [];
+
+/* ------------------------------
+   曜日入りの時刻フォーマット
+------------------------------ */
+function formatTime(isoString) {
+    const d = new Date(isoString);
+
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mi = String(d.getMinutes()).padStart(2, "0");
+    const ss = String(d.getSeconds()).padStart(2, "0");
+
+    const weekdays = ["日", "月", "火", "水", "木", "金", "土"];
+    const w = weekdays[d.getDay()];
+
+    return `${yyyy}/${mm}/${dd}(${w}) ${hh}:${mi}:${ss}`;
+}
+
+/* ------------------------------
+   QGIS 互換の安全属性フィルタ
+------------------------------ */
+function safeProperties(obj) {
+    const result = {};
+    for (const key in obj) {
+        const value = obj[key];
+        if (value === undefined) continue;
+
+        if (value instanceof Date) {
+            result[key] = value.toISOString();
+            continue;
+        }
+
+        if (Array.isArray(value)) {
+            if (value.every(v =>
+                typeof v === "string" ||
+                typeof v === "number" ||
+                typeof v === "boolean"
+            )) {
+                result[key] = value;
+            }
+            continue;
+        }
+
+        if (typeof value === "object" && value !== null) {
+            const shallow = {};
+            for (const k in value) {
+                const v = value[k];
+                if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+                    shallow[k] = v;
+                }
+            }
+            result[key] = shallow;
+            continue;
+        }
+
+        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+            result[key] = value;
+        }
+    }
+    return result;
+}
+
+/* ------------------------------
+   ピンアイコン
+------------------------------ */
+function numberedIcon(number) {
+    return L.divIcon({
+        html: `<div style="
+            background: #2a93ff;
+            color: white;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            text-align: center;
+            line-height: 22px;
+            font-size: 12px;
+            border: 2px solid white;
+        ">${number}</div>`,
+        className: "",
+        iconSize: [22, 22]
+    });
+}
+
+function redNumberedIcon(number) {
+    return L.divIcon({
+        html: `<div style="
+            background: red;
+            color: white;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            text-align: center;
+            line-height: 22px;
+            font-size: 12px;
+            border: 2px solid white;
+        ">${number}</div>`,
+        className: "",
+        iconSize: [22, 22]
+    });
+}
+
+/* ------------------------------
+   再生速度スライダー
+------------------------------ */
+function updateSpeedLabel() {
+    currentSpeed = Number(document.getElementById("speedSlider").value);
+    document.getElementById("speedLabel").innerText = currentSpeed;
+}
+
+/* ------------------------------
+   JSON → GeoJSON 変換（新規）
+------------------------------ */
+async function convertToGeoJSON() {
+    const fileInput = document.getElementById("inputFile");
+    if (!fileInput.files.length) {
+        alert("入力JSONファイルを選択してください");
+        return null;
+    }
+
+    const startDate = document.getElementById("startDate").value;
+    const endDate = document.getElementById("endDate").value;
+
+    if (!startDate || !endDate) {
+        alert("開始日と終了日を指定してください");
+        return null;
+    }
+
+    if (new Date(startDate) > new Date(endDate)) {
+        alert("開始日は終了日より前の日付を指定してください");
+        return null;
+    }
+
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59);
+
+    const file = fileInput.files[0];
+    const text = await file.text();
+    const data = JSON.parse(text);
+
+    const features = [];
+    const segments = data.semanticSegments || [];
+
+    segments.forEach(segment => {
+        if (segment.timelinePath) {
+            segment.timelinePath.forEach(point => {
+                const t = new Date(point.time);
+                if (t < start || t > end) return;
+
+                const coords = point.point.replace("°", "").split(", ");
+                const lat = parseFloat(coords[0]);
+                const lon = parseFloat(coords[1]);
+
+                if (!isNaN(lat) && !isNaN(lon)) {
+                    const props = safeProperties(point);
+                    props.time = point.time;
+
+                    features.push({
+                        type: "Feature",
+                        geometry: { type: "Point", coordinates: [lon, lat] },
+                        properties: props
+                    });
+                }
+            });
+        }
+    });
+
+    features.sort((a, b) =>
+        new Date(a.properties.time) - new Date(b.properties.time)
+    );
+
+    const lineString = {
+        type: "Feature",
+        geometry: {
+            type: "LineString",
+            coordinates: features.map(f => f.geometry.coordinates)
+        },
+        properties: { segments: safeProperties({ segments }) }
+    };
+
+    lastGeoJSON = {
+        type: "FeatureCollection",
+        features: [...features, lineString]
+    };
+
+    pointFeatures = features;
+
+    return { features, lineString };
+}
+
+/* ------------------------------
+   convert() → 地図表示つき
+------------------------------ */
+async function convert() {
+    const result = await convertToGeoJSON();
+    if (!result) return;
+
+    const { features, lineString } = result;
+
+    showOnMap(features, lineString);
+    buildList(features);
+}
+
+/* ------------------------------
+   一覧表を作成
+------------------------------ */
+function buildList(points) {
+    const list = document.getElementById("pointList");
+    list.innerHTML = "";
+
+    points.forEach((p, i) => {
+        const div = document.createElement("div");
+        div.className = "list-item";
+        div.innerText = `${i + 1}. ${formatTime(p.properties.time)}`;
+        div.onclick = () => jumpToPoint(i);
+        list.appendChild(div);
+    });
+}
+
+/* ------------------------------
+   一覧クリック → 移動
+------------------------------ */
+function jumpToPoint(index) {
+    stopAnimation();
+
+    const feature = pointFeatures[index];
+    const [lon, lat] = feature.geometry.coordinates;
+
+    if (movingMarker) map.removeLayer(movingMarker);
+
+    movingMarker = L.marker([lat, lon], {
+        icon: redNumberedIcon(index + 1)
+    })
+    .addTo(map)
+    .bindTooltip(formatTime(feature.properties.time), { permanent: true, direction: "right" })
+    .openTooltip();
+
+    map.panTo([lat, lon]);
+
+    animationIndex = index;
+}
+
+/* ------------------------------
+   地図表示
+------------------------------ */
+function showOnMap(points, lineString) {
+    if (!map) {
+        map = L.map('map').setView([35.0, 135.0], 5);
+        setStandardMap();
+    }
+
+    if (geoLayer) map.removeLayer(geoLayer);
+    if (lineLayer) map.removeLayer(lineLayer);
+
+    geoLayer = L.geoJSON(points, {
+        pointToLayer: (feature, latlng) => {
+            const index = points.indexOf(feature) + 1;
+            return L.marker(latlng, { icon: numberedIcon(index) });
+        }
+    }).addTo(map);
+
+    lineLayer = L.geoJSON(lineString, {
+        style: { color: "red", weight: 3 }
+    }).addTo(map);
+
+    lineVisible = true;
+
+    try { map.fitBounds(lineLayer.getBounds()); } catch (e) {}
+}
+
+/* ------------------------------
+   地図切替
+------------------------------ */
+function setStandardMap() {
+    if (window.baseLayer) map.removeLayer(window.baseLayer);
+    window.baseLayer = L.tileLayer(
+        'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+        { maxZoom: 19 }
+    ).addTo(map);
+}
+
+function setSatelliteMap() {
+    if (window.baseLayer) map.removeLayer(window.baseLayer);
+    window.baseLayer = L.tileLayer(
+        'https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+        { maxZoom: 20, subdomains:['mt0','mt1','mt2','mt3'] }
+    ).addTo(map);
+}
+
+/* ------------------------------
+   経路線 表示／非表示
+------------------------------ */
+function toggleLine() {
+    if (!lineLayer) return;
+
+    if (lineVisible) {
+        map.removeLayer(lineLayer);
+        lineVisible = false;
+    } else {
+        lineLayer.addTo(map);
+        lineVisible = true;
+    }
+}
+
+/* ------------------------------
+   GeoJSON 保存（改良済み）
+------------------------------ */
+async function saveGeoJSON() {
+
+    // ★ 変換していない場合は自動で変換
+    if (!lastGeoJSON) {
+        const result = await convertToGeoJSON();
+        if (!result) return;
+    }
+
+    try {
+        const handle = await window.showSaveFilePicker({
+            suggestedName: "timeline.geojson",
+            types: [{
+                description: "GeoJSON file",
+                accept: { "application/geo+json": [".geojson"] }
+            }]
+        });
+
+        const writable = await handle.createWritable();
+        await writable.write(JSON.stringify(lastGeoJSON, null, 4));
+        await writable.close();
+
+        alert("GeoJSON を保存しました");
+
+    } catch (err) {
+        console.error(err);
+        alert("保存がキャンセルされました");
+    }
+}
+
+/* ------------------------------
+   自動再生
+------------------------------ */
+function startAnimation() {
+    if (!lastGeoJSON) {
+        alert("アニメーションするデータがありません");
+        return;
+    }
+
+    const points = pointFeatures;
+    if (!points.length) return;
+
+    stopAnimation();
+    animationIndex = 0;
+
+    moveToPoint(points, 0);
+
+    animationTimer = setInterval(() => {
+        animationIndex++;
+        if (animationIndex >= points.length) {
+            stopAnimation();
+            alert("再生が終了しました");
+            return;
+        }
+        moveToPoint(points, animationIndex);
+    }, currentSpeed);
+}
+
+/* ------------------------------
+   停止
+------------------------------ */
+function stopAnimation() {
+    if (animationTimer) {
+        clearInterval(animationTimer);
+        animationTimer = null;
+    }
+}
+
+/* ------------------------------
+   次へ進む / 戻る
+------------------------------ */
+function stepForward() {
+    stopAnimation();
+    const points = pointFeatures;
+    animationIndex = Math.min(animationIndex + 1, points.length - 1);
+    moveToPoint(points, animationIndex);
+}
+
+function stepBackward() {
+    stopAnimation();
+    const points = pointFeatures;
+    animationIndex = Math.max(animationIndex - 1, 0);
+    moveToPoint(points, animationIndex);
+}
+
+/* ------------------------------
+   指定ポイントへ移動
+------------------------------ */
+function moveToPoint(points, index) {
+    const feature = points[index];
+    const [lon, lat] = feature.geometry.coordinates;
+
+    if (movingMarker) map.removeLayer(movingMarker);
+
+    movingMarker = L.marker([lat, lon], {
+        icon: redNumberedIcon(index + 1)
+    })
+    .addTo(map)
+    .bindTooltip(formatTime(feature.properties.time), { permanent: true, direction: "right" })
+    .openTooltip();
+
+    map.panTo([lat, lon]);
+}
+
+</script>
+
+</body>
+</html>
